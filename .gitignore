@@ -3,4 +3,4 @@ __pycache__/
 *.pyo
 synesth_*.png
 .venv/
-hand_landmarker.task
+*.task
