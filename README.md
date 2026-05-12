@@ -31,8 +31,10 @@ Requer **Python 3.10+** (testado em 3.14) e uma webcam.
 ```bash
 git clone https://github.com/welerson-py/synesth.git
 cd synesth
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+> No Windows, se `pip` não estiver no PATH, use sempre `python -m pip` no lugar de `pip`.
 
 Dependências:
 
