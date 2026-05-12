@@ -12,6 +12,7 @@ Controles:
   Q        -> sair
   K        -> liga/desliga modo caleidoscopio
   M        -> muta o audio
+  C        -> recalibra o fundo (use sem maos no quadro)
   ESPACO   -> salva print PNG
 """
 
@@ -193,9 +194,12 @@ smile_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_smile.xml"
 )
 
-# Tom de pele em HSV (bem permissivo, funciona razoavelmente em iluminacao normal)
-LOWER_SKIN = np.array([0, 25, 60], dtype=np.uint8)
-UPPER_SKIN = np.array([25, 180, 255], dtype=np.uint8)
+# Tom de pele em HSV - mais restrito pra evitar pegar parede/madeira
+LOWER_SKIN_HSV = np.array([0, 40, 70], dtype=np.uint8)
+UPPER_SKIN_HSV = np.array([20, 170, 255], dtype=np.uint8)
+# Tom de pele em YCrCb - faixa classica que filtra fundos coloridos
+LOWER_SKIN_YCRCB = np.array([0, 135, 85], dtype=np.uint8)
+UPPER_SKIN_YCRCB = np.array([255, 180, 135], dtype=np.uint8)
 
 # Escala pentatonica maior em C, varias oitavas (sempre soa bem)
 PENT_FREQS = [
@@ -216,19 +220,32 @@ def detect_face_emotion(gray):
     return (x, y, w, h), emotion
 
 
-def detect_hands(frame, exclude_box=None):
+def detect_hands(frame, fg_mask, exclude_box=None):
+    """Detecta maos exigindo cor de pele (HSV ∩ YCrCb) E foreground em movimento."""
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LOWER_SKIN, UPPER_SKIN)
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    skin_hsv = cv2.inRange(hsv, LOWER_SKIN_HSV, UPPER_SKIN_HSV)
+    skin_ycrcb = cv2.inRange(ycrcb, LOWER_SKIN_YCRCB, UPPER_SKIN_YCRCB)
+    skin = cv2.bitwise_and(skin_hsv, skin_ycrcb)
+
+    # So conta como mao o que e pele E foreground (descarta parede/movel estatico)
+    mask = cv2.bitwise_and(skin, fg_mask)
+
     if exclude_box is not None:
         x, y, w, h = exclude_box
-        pad = 25
+        pad = 30
         y0 = max(0, y - pad)
         x0 = max(0, x - pad)
         mask[y0 : y + h + pad, x0 : x + w + pad] = 0
-    mask = cv2.medianBlur(mask, 7)
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
+
+    # Limpa ruido e une regioes proximas
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > 2500]
+    contours = [c for c in contours if cv2.contourArea(c) > 4000]
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
     hands = []
     for c in contours:
@@ -412,6 +429,15 @@ def main():
     trail_right = Trail((100, 255, 160))  # mao direita -> verde
     trail_left = Trail((255, 120, 255))   # mao esquerda -> magenta
 
+    def make_bg_subtractor():
+        return cv2.createBackgroundSubtractorMOG2(
+            history=400, varThreshold=35, detectShadows=False
+        )
+
+    bg_sub = make_bg_subtractor()
+    hand_present_frames = 0  # contador pra debounce
+    last_dom_hue = -999.0
+
     prev_gray = None
     smooth_freq = 0.0
     smooth_vol = 0.0
@@ -420,7 +446,7 @@ def main():
     last_snare = 0.0
     kaleidoscope = False
 
-    print("SynesthAI rodando. Q sai | K caleidoscopio | M mute | ESPACO printa.")
+    print("SynesthAI rodando. Q sai | K caleidoscopio | M mute | C recalibra | ESPACO printa.")
 
     fps_t0 = time.time()
     fps_counter = 0
@@ -436,10 +462,15 @@ def main():
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+            # atualiza modelo de fundo (taxa de aprendizado lenta pra nao "engolir" maos paradas)
+            fg_mask = bg_sub.apply(frame, learningRate=0.003)
+            # binariza forte e limpa
+            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
             # rosto e emocao
             face_box, emotion = detect_face_emotion(gray)
             if face_box is not None:
-                audio.drone_target = 0.55
+                audio.drone_target = 0.35
                 audio.set_mode(emotion == "feliz")
                 fx, fy, fw_, fh_ = face_box
                 color = (110, 220, 255) if emotion == "feliz" else (220, 160, 255)
@@ -450,10 +481,19 @@ def main():
             else:
                 audio.drone_target *= 0.92
 
-            # maos
-            hands = detect_hands(frame, face_box)
+            # maos - exige cor de pele E foreground em movimento
+            hands = detect_hands(frame, fg_mask, face_box)
             now = time.time()
+
+            # debounce: so considera mao depois de 2 frames seguidos detectando
             if len(hands) >= 1:
+                hand_present_frames = min(hand_present_frames + 1, 5)
+            else:
+                hand_present_frames = max(hand_present_frames - 1, 0)
+
+            hand_active = hand_present_frames >= 2
+
+            if hand_active and len(hands) >= 1:
                 # mao a direita do quadro (espelhado -> mao direita do usuario)
                 rh = hands[-1]
                 rx, ry, _ = rh
@@ -481,7 +521,10 @@ def main():
                 else:
                     trail_left.fade()
             else:
-                smooth_vol *= 0.85
+                # sem mao: corta som rapido
+                smooth_vol *= 0.55
+                if smooth_vol < 0.01:
+                    smooth_vol = 0.0
                 audio.target_vol = smooth_vol
                 trail_right.fade()
                 trail_left.fade()
@@ -505,14 +548,18 @@ def main():
                 audio.trigger_snare()
                 last_snare = now
 
-            # cor dominante -> voz harmonica
+            # cor dominante -> voz harmonica (so dispara quando a cor MUDA o suficiente)
             dom = dominant_hue(frame)
-            if dom is not None and now - last_color_emit > 0.45:
-                audio.add_color_voice(hue_to_freq(dom), amp=0.12, life=0.85)
-                last_color_emit = now
-                col = hue_to_bgr(int(dom))
-                particles.emit(w - 30, 75, col, count=4, speed=2)
-                cv2.rectangle(frame, (w - 30, 70), (w - 10, 90), col, -1)
+            if dom is not None:
+                hue_changed = abs(dom - last_dom_hue) > 12 or last_dom_hue < -100
+                if hue_changed and now - last_color_emit > 0.6:
+                    audio.add_color_voice(hue_to_freq(dom), amp=0.12, life=0.85)
+                    last_color_emit = now
+                    last_dom_hue = dom
+                    col = hue_to_bgr(int(dom))
+                    particles.emit(w - 30, 75, col, count=4, speed=2)
+                col_box = hue_to_bgr(int(dom))
+                cv2.rectangle(frame, (w - 30, 70), (w - 10, 90), col_box, -1)
 
             if kaleidoscope:
                 apply_kaleidoscope(frame)
@@ -547,6 +594,10 @@ def main():
                 kaleidoscope = not kaleidoscope
             elif key == ord("m"):
                 audio.muted = not audio.muted
+            elif key == ord("c"):
+                bg_sub = make_bg_subtractor()
+                hand_present_frames = 0
+                print("Fundo recalibrado.")
             elif key == 32:  # espaco
                 fn = f"synesth_{int(now)}.png"
                 cv2.imwrite(fn, frame)
