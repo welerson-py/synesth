@@ -12,7 +12,7 @@ Controles:
   Q        -> sair
   K        -> liga/desliga modo caleidoscopio
   M        -> muta o audio
-  C        -> recalibra o fundo (use sem maos no quadro)
+  C        -> calibra o tom de pele (coloque a mao no alvo e aperte)
   ESPACO   -> salva print PNG
 """
 
@@ -194,12 +194,52 @@ smile_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_smile.xml"
 )
 
-# Tom de pele em HSV - mais restrito pra evitar pegar parede/madeira
-LOWER_SKIN_HSV = np.array([0, 40, 70], dtype=np.uint8)
-UPPER_SKIN_HSV = np.array([20, 170, 255], dtype=np.uint8)
-# Tom de pele em YCrCb - faixa classica que filtra fundos coloridos
-LOWER_SKIN_YCRCB = np.array([0, 135, 85], dtype=np.uint8)
-UPPER_SKIN_YCRCB = np.array([255, 180, 135], dtype=np.uint8)
+# Faixa padrao de tom de pele em HSV (substituida pela calibracao do usuario quando ele aperta C)
+DEFAULT_SKIN_HSV_LOW = np.array([0, 30, 60], dtype=np.uint8)
+DEFAULT_SKIN_HSV_HIGH = np.array([25, 180, 255], dtype=np.uint8)
+
+
+class SkinModel:
+    """Modelo de cor de pele - inicia com um range padrao e pode ser calibrado."""
+
+    def __init__(self):
+        self.low = DEFAULT_SKIN_HSV_LOW.copy()
+        self.high = DEFAULT_SKIN_HSV_HIGH.copy()
+        self.calibrated = False
+
+    def calibrate(self, frame, box):
+        x, y, w, h = box
+        roi = frame[y : y + h, x : x + w]
+        if roi.size == 0:
+            return False
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        h_vals = hsv[:, :, 0].flatten()
+        s_vals = hsv[:, :, 1].flatten()
+        v_vals = hsv[:, :, 2].flatten()
+        # percentis 5-95 com margem - robusto a sombras/reflexos no recorte
+        self.low = np.array(
+            [
+                max(0, int(np.percentile(h_vals, 5)) - 8),
+                max(20, int(np.percentile(s_vals, 5)) - 30),
+                max(40, int(np.percentile(v_vals, 5)) - 40),
+            ],
+            dtype=np.uint8,
+        )
+        self.high = np.array(
+            [
+                min(179, int(np.percentile(h_vals, 95)) + 8),
+                min(255, int(np.percentile(s_vals, 95)) + 30),
+                min(255, int(np.percentile(v_vals, 95)) + 40),
+            ],
+            dtype=np.uint8,
+        )
+        self.calibrated = True
+        print(f"Pele calibrada. HSV low={self.low.tolist()} high={self.high.tolist()}")
+        return True
+
+    def mask(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        return cv2.inRange(hsv, self.low, self.high)
 
 # Escala pentatonica maior em C, varias oitavas (sempre soa bem)
 PENT_FREQS = [
@@ -220,32 +260,26 @@ def detect_face_emotion(gray):
     return (x, y, w, h), emotion
 
 
-def detect_hands(frame, fg_mask, exclude_box=None):
-    """Detecta maos exigindo cor de pele (HSV ∩ YCrCb) E foreground em movimento."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    skin_hsv = cv2.inRange(hsv, LOWER_SKIN_HSV, UPPER_SKIN_HSV)
-    skin_ycrcb = cv2.inRange(ycrcb, LOWER_SKIN_YCRCB, UPPER_SKIN_YCRCB)
-    skin = cv2.bitwise_and(skin_hsv, skin_ycrcb)
-
-    # So conta como mao o que e pele E foreground (descarta parede/movel estatico)
-    mask = cv2.bitwise_and(skin, fg_mask)
+def detect_hands(frame, skin_model, exclude_box=None, min_area=3500):
+    """Detecta maos via tom de pele (calibrado) + morfologia."""
+    mask = skin_model.mask(frame)
 
     if exclude_box is not None:
         x, y, w, h = exclude_box
-        pad = 30
+        pad = 35
         y0 = max(0, y - pad)
         x0 = max(0, x - pad)
         mask[y0 : y + h + pad, x0 : x + w + pad] = 0
 
-    # Limpa ruido e une regioes proximas
+    # Limpa ruido pequeno, fecha buracos da palma, junta dedos
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    _, mask = cv2.threshold(mask, 60, 255, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > 4000]
+    contours = [c for c in contours if cv2.contourArea(c) > min_area]
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
     hands = []
     for c in contours:
@@ -256,7 +290,23 @@ def detect_hands(frame, fg_mask, exclude_box=None):
         cy = int(M["m01"] / M["m00"])
         hands.append((cx, cy, cv2.contourArea(c)))
     hands.sort(key=lambda h: h[0])  # esquerda -> direita
-    return hands
+    return hands, mask
+
+
+def motion_in_area(prev_gray, gray, exclude_regions):
+    """Movimento global excluindo regioes (mao, rosto)."""
+    if prev_gray is None:
+        return 0.0, None
+    diff = cv2.absdiff(prev_gray, gray)
+    _, thr = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    for region in exclude_regions:
+        if region["type"] == "rect":
+            x, y, w, h = region["box"]
+            cv2.rectangle(thr, (x, y), (x + w, y + h), 0, -1)
+        elif region["type"] == "circle":
+            cv2.circle(thr, region["center"], region["radius"], 0, -1)
+    amount = float(np.sum(thr) / 255.0 / thr.size)
+    return amount, thr
 
 
 def motion_amount(prev_gray, gray):
@@ -429,12 +479,7 @@ def main():
     trail_right = Trail((100, 255, 160))  # mao direita -> verde
     trail_left = Trail((255, 120, 255))   # mao esquerda -> magenta
 
-    def make_bg_subtractor():
-        return cv2.createBackgroundSubtractorMOG2(
-            history=400, varThreshold=35, detectShadows=False
-        )
-
-    bg_sub = make_bg_subtractor()
+    skin_model = SkinModel()
     hand_present_frames = 0  # contador pra debounce
     last_dom_hue = -999.0
 
@@ -445,8 +490,11 @@ def main():
     last_kick = 0.0
     last_snare = 0.0
     kaleidoscope = False
+    show_skin_debug = False
 
-    print("SynesthAI rodando. Q sai | K caleidoscopio | M mute | C recalibra | ESPACO printa.")
+    print("SynesthAI rodando.")
+    print("PASSO 1: ponha a mao no quadrado central e aperte C pra calibrar a pele.")
+    print("Q sai | K caleidoscopio | M mute | D mostra mascara | ESPACO printa.")
 
     fps_t0 = time.time()
     fps_counter = 0
@@ -462,11 +510,6 @@ def main():
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # atualiza modelo de fundo (taxa de aprendizado lenta pra nao "engolir" maos paradas)
-            fg_mask = bg_sub.apply(frame, learningRate=0.003)
-            # binariza forte e limpa
-            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
             # rosto e emocao
             face_box, emotion = detect_face_emotion(gray)
             if face_box is not None:
@@ -481,8 +524,20 @@ def main():
             else:
                 audio.drone_target *= 0.92
 
-            # maos - exige cor de pele E foreground em movimento
-            hands = detect_hands(frame, fg_mask, face_box)
+            # alvo de calibracao (sempre visivel) - centro da tela
+            cal_w, cal_h = 140, 140
+            cal_x = w // 2 - cal_w // 2
+            cal_y = h // 2 - cal_h // 2
+            cal_box = (cal_x, cal_y, cal_w, cal_h)
+            cal_color = (90, 220, 90) if skin_model.calibrated else (90, 90, 255)
+            cv2.rectangle(frame, (cal_x, cal_y), (cal_x + cal_w, cal_y + cal_h), cal_color, 2, cv2.LINE_AA)
+            if not skin_model.calibrated:
+                cv2.putText(frame, "PONHA A MAO AQUI E APERTE C",
+                            (cal_x - 60, cal_y - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (90, 90, 255), 2, cv2.LINE_AA)
+
+            # maos via tom de pele calibrado
+            hands, skin_mask = detect_hands(frame, skin_model, face_box)
             now = time.time()
 
             # debounce: so considera mao depois de 2 frames seguidos detectando
@@ -532,9 +587,21 @@ def main():
             trail_right.draw(frame)
             trail_left.draw(frame)
 
-            # movimento -> percussao + particulas
-            mot, mot_mask = motion_amount(prev_gray, gray)
-            if mot > 0.035 and now - last_kick > 0.25:
+            # movimento -> percussao (mas IGNORANDO regioes de mao/rosto pra nao
+            # disparar snare so de tocar o theremin)
+            exclude_regions = []
+            if face_box is not None:
+                fx, fy, fw_, fh_ = face_box
+                exclude_regions.append({
+                    "type": "rect",
+                    "box": (max(0, fx - 25), max(0, fy - 25), fw_ + 50, fh_ + 50),
+                })
+            for hx, hy, area in hands:
+                r = int(math.sqrt(max(area, 1) / math.pi)) + 35
+                exclude_regions.append({"type": "circle", "center": (hx, hy), "radius": r})
+
+            mot, mot_mask = motion_in_area(prev_gray, gray, exclude_regions)
+            if mot > 0.05 and now - last_kick > 0.35:
                 audio.trigger_kick()
                 last_kick = now
                 if mot_mask is not None:
@@ -544,7 +611,7 @@ def main():
                         for idx in sample[:6]:
                             px, py = int(xs[idx]), int(ys[idx])
                             particles.emit(px, py, (120, 220, 255), count=3, speed=4)
-            elif mot > 0.012 and now - last_snare > 0.18:
+            elif mot > 0.025 and now - last_snare > 0.3:
                 audio.trigger_snare()
                 last_snare = now
 
@@ -585,6 +652,8 @@ def main():
             )
 
             cv2.imshow("SynesthAI", frame)
+            if show_skin_debug:
+                cv2.imshow("Mascara de pele (debug)", skin_mask)
             prev_gray = gray
 
             key = cv2.waitKey(1) & 0xFF
@@ -595,9 +664,10 @@ def main():
             elif key == ord("m"):
                 audio.muted = not audio.muted
             elif key == ord("c"):
-                bg_sub = make_bg_subtractor()
-                hand_present_frames = 0
-                print("Fundo recalibrado.")
+                if skin_model.calibrate(frame, cal_box):
+                    hand_present_frames = 0
+            elif key == ord("d"):
+                show_skin_debug = not show_skin_debug
             elif key == 32:  # espaco
                 fn = f"synesth_{int(now)}.png"
                 cv2.imwrite(fn, frame)
