@@ -4,7 +4,7 @@
 
 SynesthAI transforma sua webcam num instrumento multissensorial: suas mãos viram um theremin, as cores ao seu redor disparam vozes harmônicas, seu sorriso muda o acorde de fundo e qualquer movimento do corpo vira percussão. Tudo isso enquanto partículas, trilhas coloridas e uma onda de áudio ao vivo são desenhadas por cima da imagem.
 
-Sem MediaPipe, sem modelos pesados. Roda em **Python 3.14** usando só OpenCV (Haar cascades), NumPy e sounddevice.
+Detecção de mão via **MediaPipe HandLandmarker** (CNN do Google — funciona em qualquer iluminação e tom de pele), rosto/sorriso via Haar cascade do OpenCV, áudio via síntese aditiva em tempo real. Roda em **Python 3.14**.
 
 ---
 
@@ -38,9 +38,12 @@ python -m pip install -r requirements.txt
 
 Dependências:
 
-- `opencv-python` — captura, Haar cascades, processamento de imagem
+- `opencv-python` — captura, Haar cascades (rosto/sorriso), processamento de imagem
 - `numpy` — síntese de áudio e operações vetoriais
 - `sounddevice` — saída de áudio em tempo real via callback
+- `mediapipe` — detecção de mão por CNN (HandLandmarker)
+
+> Na primeira execução, o programa baixa automaticamente o modelo `hand_landmarker.task` (~8 MB) do Google.
 
 ---
 
@@ -61,6 +64,8 @@ Uma janela "SynesthAI" abre com a câmera. Aperte **Q** pra sair.
 | `M` | Muta o áudio |
 | `ESPAÇO` | Salva print PNG na pasta atual |
 
+A detecção de mão funciona out of the box: assim que sua mão aparece no quadro, o esqueleto colorido dos 21 pontos é desenhado e o theremin começa a tocar. Sem calibração.
+
 ---
 
 ## Como funciona por dentro
@@ -76,12 +81,12 @@ Síntese aditiva em tempo real via callback do `sounddevice` a 44.1 kHz, blocos 
 - **Snare**: ruído branco com envelope curto.
 - Tudo passa por `tanh` no final pra soft clip.
 
-### Visão (OpenCV)
+### Visão
 
-- **Rosto**: `haarcascade_frontalface_default.xml` + `haarcascade_smile.xml` pra detectar emoção.
-- **Mãos**: segmentação de tom de pele em HSV, exclusão da região do rosto, maior(es) contorno(s) viram as mãos. Não é perfeito mas funciona sem modelo.
-- **Movimento**: `cv2.absdiff` entre frames consecutivos → threshold → área de pixels em movimento.
-- **Cor dominante**: histograma de matiz HSV com 12 bins, ignorando pixels muito escuros/dessaturados.
+- **Mãos**: MediaPipe **HandLandmarker** (modelo `.task` baixado automaticamente). Detecta até 2 mãos e devolve 21 landmarks por mão. O centróide vem da média dos 5 pontos da palma (`0, 5, 9, 13, 17`).
+- **Rosto / emoção**: `haarcascade_frontalface_default.xml` + `haarcascade_smile.xml`.
+- **Movimento**: `cv2.absdiff` entre frames consecutivos. Antes de medir, as áreas das mãos e do rosto são **mascaradas** — assim a percussão só dispara em movimento *além* do que está fazendo o theremin.
+- **Cor dominante**: histograma de matiz HSV com 12 bins, ignorando pixels muito escuros/dessaturados. Só dispara nota nova quando a cor muda de verdade (>12° de matiz).
 
 ### Visuais
 
@@ -105,14 +110,14 @@ Síntese aditiva em tempo real via callback do `sounddevice` a 44.1 kHz, blocos 
 
 ## Ajustes
 
-Se a detecção de mão estiver instável na sua iluminação, ajuste os limiares HSV no topo de `synesthAI.py`:
+Pra trocar a escala do theremin, edite `PENT_FREQS` no `synesthAI.py` (lista de frequências em Hz). É pentatônica em C por padrão — qualquer posição da mão soa musical.
+
+Pra mudar a sensibilidade da percussão, ajuste os limiares no `main()`:
 
 ```python
-LOWER_SKIN = np.array([0, 25, 60], dtype=np.uint8)
-UPPER_SKIN = np.array([25, 180, 255], dtype=np.uint8)
+if mot > 0.05  and now - last_kick  > 0.35: ...   # kick
+elif mot > 0.025 and now - last_snare > 0.3:  ...   # snare
 ```
-
-Pra trocar a escala do theremin, edite `PENT_FREQS` (lista de frequências em Hz). Ela é pentatônica em C por padrão — qualquer posição da mão soa musical.
 
 ---
 

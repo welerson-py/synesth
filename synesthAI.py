@@ -2,28 +2,35 @@
 SynesthAI - A camera sinestesica em tempo real.
 
 Transforma o que a camera ve em som, cor e movimento:
-  - Maos viram um theremin pentatonico (X = nota, Y = volume).
+  - Maos viram um theremin pentatonico (X = nota, Y = volume), com
+    deteccao por CNN (MediaPipe HandLandmarker).
   - Cores dominantes do ambiente disparam vozes harmonicas.
   - Rosto sorrindo muda o drone de fundo de menor para maior.
-  - Movimento corporal vira percussao (kick / snare sintetizados).
-  - Particulas, trilhas e onda de audio ao vivo na tela.
+  - Movimento corporal (fora de maos e rosto) vira percussao.
+  - Esqueleto da mao, particulas, trilhas e onda de audio na tela.
 
 Controles:
   Q        -> sair
   K        -> liga/desliga modo caleidoscopio
   M        -> muta o audio
-  C        -> calibra o tom de pele (coloque a mao no alvo e aperte)
   ESPACO   -> salva print PNG
 """
 
 import math
+import os
+import sys
 import time
-import threading
+import urllib.request
 from collections import deque
 
 import cv2
 import numpy as np
 import sounddevice as sd
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
 
 # ===================== AUDIO =====================
 
@@ -51,7 +58,6 @@ class AudioEngine:
 
         # Vozes de cor (notas curtas tocadas pela cor dominante)
         self.color_voices = []  # [freq, phase, t_left, amp, total]
-        self.lock = threading.Lock()
 
         # Percussao
         self.kick_env = 0.0
@@ -69,18 +75,17 @@ class AudioEngine:
         self.snare_env = 0.8
 
     def add_color_voice(self, freq, amp=0.12, life=0.9):
-        with self.lock:
-            if len(self.color_voices) > 10:
-                self.color_voices.pop(0)
-            self.color_voices.append([freq, 0.0, life, amp, life])
+        if len(self.color_voices) > 10:
+            self.color_voices.pop(0)
+        self.color_voices.append([freq, 0.0, life, amp, life])
 
     def set_mode(self, happy):
         if happy:
-            self.drone_intervals = (1.0, 1.2599, 1.4983)  # tres notas maior
-            self.drone_root = 174.61  # F3
+            self.drone_intervals = (1.0, 1.2599, 1.4983)
+            self.drone_root = 174.61  # F3 maior
         else:
-            self.drone_intervals = (1.0, 1.1892, 1.4983)  # tres notas menor
-            self.drone_root = 146.83  # D3
+            self.drone_intervals = (1.0, 1.1892, 1.4983)
+            self.drone_root = 146.83  # D3 menor
 
     # ----- callback -----
     def callback(self, outdata, frames, time_info, status):
@@ -91,7 +96,7 @@ class AudioEngine:
             outdata[:, 1] = 0
             return
 
-        # Theremin com suavizacao de freq e amplitude
+        # Theremin
         self.current_freq += (self.target_freq - self.current_freq) * 0.25
         if self.target_vol > 0.001 and self.current_freq > 20:
             f = self.current_freq
@@ -107,7 +112,6 @@ class AudioEngine:
             self.phase_theremin = (self.phase_theremin + phase_inc * frames) % (2 * math.pi)
             self.last_vol = self.target_vol
         else:
-            # decai suavemente
             fade = np.linspace(self.last_vol, 0, frames)
             if self.last_vol > 0.001 and self.current_freq > 20:
                 phase_inc = 2 * math.pi * self.current_freq / SAMPLE_RATE
@@ -126,25 +130,23 @@ class AudioEngine:
                 out += (np.sin(phases) * self.drone_vol * 0.07).astype(np.float32)
                 self.drone_phases[i] = (self.drone_phases[i] + phase_inc * frames) % (2 * math.pi)
 
-        # Vozes de cor (com envelope linear)
-        with self.lock:
-            new = []
-            for v in self.color_voices:
-                f, phase, t_left, amp, total = v
-                phase_inc = 2 * math.pi * f / SAMPLE_RATE
-                phases = phase + phase_inc * np.arange(frames)
-                env_start = max(0.0, t_left / total)
-                t_after = t_left - frames / SAMPLE_RATE
-                env_end = max(0.0, t_after / total)
-                env_curve = np.linspace(env_start, env_end, frames)
-                # leve vibrato
-                vibrato = 1 + 0.005 * np.sin(2 * math.pi * 5.5 * np.arange(frames) / SAMPLE_RATE)
-                out += (np.sin(phases * vibrato) * amp * env_curve * 0.55).astype(np.float32)
-                if t_after > 0:
-                    new.append([f, (phases[-1] + phase_inc) % (2 * math.pi), t_after, amp, total])
-            self.color_voices = new
+        # Vozes de cor
+        new = []
+        for v in self.color_voices:
+            f, phase, t_left, amp, total = v
+            phase_inc = 2 * math.pi * f / SAMPLE_RATE
+            phases = phase + phase_inc * np.arange(frames)
+            env_start = max(0.0, t_left / total)
+            t_after = t_left - frames / SAMPLE_RATE
+            env_end = max(0.0, t_after / total)
+            env_curve = np.linspace(env_start, env_end, frames)
+            vibrato = 1 + 0.005 * np.sin(2 * math.pi * 5.5 * np.arange(frames) / SAMPLE_RATE)
+            out += (np.sin(phases * vibrato) * amp * env_curve * 0.55).astype(np.float32)
+            if t_after > 0:
+                new.append([f, (phases[-1] + phase_inc) % (2 * math.pi), t_after, amp, total])
+        self.color_voices = new
 
-        # Kick (sweep de baixo)
+        # Kick
         if self.kick_env > 0.001:
             t = np.arange(frames) / SAMPLE_RATE
             env_curve = np.maximum(0, self.kick_env - t * 5.0)
@@ -153,7 +155,7 @@ class AudioEngine:
             out += (np.sin(phase) * env_curve * 0.7).astype(np.float32)
             self.kick_env = max(0.0, self.kick_env - frames / SAMPLE_RATE * 5.0)
 
-        # Snare (ruido envelopado)
+        # Snare
         if self.snare_env > 0.001:
             noise = np.random.uniform(-1, 1, frames).astype(np.float32)
             t = np.arange(frames) / SAMPLE_RATE
@@ -161,7 +163,6 @@ class AudioEngine:
             out += noise * env_curve * 0.3
             self.snare_env = max(0.0, self.snare_env - frames / SAMPLE_RATE * 8.0)
 
-        # Soft clip e stereo
         out = np.tanh(out * 1.1) * 0.8
         outdata[:, 0] = out
         outdata[:, 1] = out
@@ -194,59 +195,86 @@ smile_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_smile.xml"
 )
 
-# Faixa padrao de tom de pele em HSV (substituida pela calibracao do usuario quando ele aperta C)
-DEFAULT_SKIN_HSV_LOW = np.array([0, 30, 60], dtype=np.uint8)
-DEFAULT_SKIN_HSV_HIGH = np.array([25, 180, 255], dtype=np.uint8)
-
-
-class SkinModel:
-    """Modelo de cor de pele - inicia com um range padrao e pode ser calibrado."""
-
-    def __init__(self):
-        self.low = DEFAULT_SKIN_HSV_LOW.copy()
-        self.high = DEFAULT_SKIN_HSV_HIGH.copy()
-        self.calibrated = False
-
-    def calibrate(self, frame, box):
-        x, y, w, h = box
-        roi = frame[y : y + h, x : x + w]
-        if roi.size == 0:
-            return False
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        h_vals = hsv[:, :, 0].flatten()
-        s_vals = hsv[:, :, 1].flatten()
-        v_vals = hsv[:, :, 2].flatten()
-        # percentis 5-95 com margem - robusto a sombras/reflexos no recorte
-        self.low = np.array(
-            [
-                max(0, int(np.percentile(h_vals, 5)) - 8),
-                max(20, int(np.percentile(s_vals, 5)) - 30),
-                max(40, int(np.percentile(v_vals, 5)) - 40),
-            ],
-            dtype=np.uint8,
-        )
-        self.high = np.array(
-            [
-                min(179, int(np.percentile(h_vals, 95)) + 8),
-                min(255, int(np.percentile(s_vals, 95)) + 30),
-                min(255, int(np.percentile(v_vals, 95)) + 40),
-            ],
-            dtype=np.uint8,
-        )
-        self.calibrated = True
-        print(f"Pele calibrada. HSV low={self.low.tolist()} high={self.high.tolist()}")
-        return True
-
-    def mask(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        return cv2.inRange(hsv, self.low, self.high)
-
-# Escala pentatonica maior em C, varias oitavas (sempre soa bem)
 PENT_FREQS = [
     220.00, 246.94, 277.18, 329.63, 369.99,
     440.00, 493.88, 554.37, 659.25, 739.99,
     880.00, 987.77, 1108.73, 1318.51,
 ]
+
+# Conexoes do esqueleto da mao (21 landmarks no modelo do MediaPipe)
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # polegar
+    (0, 5), (5, 6), (6, 7), (7, 8),          # indicador
+    (5, 9), (9, 10), (10, 11), (11, 12),     # medio
+    (9, 13), (13, 14), (14, 15), (15, 16),   # anelar
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),  # minimo
+]
+
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+
+
+def ensure_hand_model():
+    """Garante o arquivo do modelo de maos local; baixa se nao existir."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "hand_landmarker.task")
+    if not os.path.exists(path):
+        print(f"Baixando modelo de deteccao de maos (~8 MB) de {MODEL_URL} ...")
+        urllib.request.urlretrieve(MODEL_URL, path)
+        print(f"Modelo salvo em {path}")
+    return path
+
+
+class HandTracker:
+    """Detector/rastreador de maos usando MediaPipe HandLandmarker."""
+
+    def __init__(self, model_path):
+        opts = mp_vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=model_path),
+            num_hands=2,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.landmarker = mp_vision.HandLandmarker.create_from_options(opts)
+        self.t0 = time.time()
+
+    def detect(self, frame_bgr):
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        ts_ms = int((time.time() - self.t0) * 1000)
+        result = self.landmarker.detect_for_video(mp_image, ts_ms)
+        hands = []
+        if not result.hand_landmarks:
+            return hands
+        for i, lm_list in enumerate(result.hand_landmarks):
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in lm_list]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            bbox = (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+            # centroide pela palma (0, 5, 9, 13, 17)
+            palm = [0, 5, 9, 13, 17]
+            cx = int(sum(pts[k][0] for k in palm) / len(palm))
+            cy = int(sum(pts[k][1] for k in palm) / len(palm))
+            hands.append({
+                "cx": cx, "cy": cy,
+                "bbox": bbox,
+                "landmarks": pts,
+            })
+        # ordena esquerda -> direita do frame
+        hands.sort(key=lambda h: h["cx"])
+        return hands
+
+    def close(self):
+        try:
+            self.landmarker.close()
+        except Exception:
+            pass
 
 
 def detect_face_emotion(gray):
@@ -260,60 +288,13 @@ def detect_face_emotion(gray):
     return (x, y, w, h), emotion
 
 
-def detect_hands(frame, skin_model, exclude_box=None, min_area=3500):
-    """Detecta maos via tom de pele (calibrado) + morfologia."""
-    mask = skin_model.mask(frame)
-
-    if exclude_box is not None:
-        x, y, w, h = exclude_box
-        pad = 35
-        y0 = max(0, y - pad)
-        x0 = max(0, x - pad)
-        mask[y0 : y + h + pad, x0 : x + w + pad] = 0
-
-    # Limpa ruido pequeno, fecha buracos da palma, junta dedos
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-    _, mask = cv2.threshold(mask, 60, 255, cv2.THRESH_BINARY)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > min_area]
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
-    hands = []
-    for c in contours:
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        hands.append((cx, cy, cv2.contourArea(c)))
-    hands.sort(key=lambda h: h[0])  # esquerda -> direita
-    return hands, mask
-
-
-def motion_in_area(prev_gray, gray, exclude_regions):
-    """Movimento global excluindo regioes (mao, rosto)."""
+def motion_in_area(prev_gray, gray, exclude_rects):
     if prev_gray is None:
         return 0.0, None
     diff = cv2.absdiff(prev_gray, gray)
     _, thr = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-    for region in exclude_regions:
-        if region["type"] == "rect":
-            x, y, w, h = region["box"]
-            cv2.rectangle(thr, (x, y), (x + w, y + h), 0, -1)
-        elif region["type"] == "circle":
-            cv2.circle(thr, region["center"], region["radius"], 0, -1)
-    amount = float(np.sum(thr) / 255.0 / thr.size)
-    return amount, thr
-
-
-def motion_amount(prev_gray, gray):
-    if prev_gray is None:
-        return 0.0, None
-    diff = cv2.absdiff(prev_gray, gray)
-    _, thr = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    for x, y, w, h in exclude_rects:
+        cv2.rectangle(thr, (x, y), (x + w, y + h), 0, -1)
     amount = float(np.sum(thr) / 255.0 / thr.size)
     return amount, thr
 
@@ -337,7 +318,6 @@ def hue_to_bgr(hue):
 
 
 def hue_to_freq(hue):
-    # 12 graus cromaticos, duas oitavas
     scale = [
         261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88,
         523.25, 587.33, 659.26, 698.46, 783.99,
@@ -357,17 +337,14 @@ class ParticleSystem:
         for _ in range(count):
             angle = np.random.uniform(0, 2 * math.pi)
             spd = np.random.uniform(0.5, 1.5) * speed
-            self.particles.append(
-                {
-                    "x": float(x),
-                    "y": float(y),
-                    "vx": math.cos(angle) * spd,
-                    "vy": math.sin(angle) * spd - 1.5,
-                    "life": 1.0,
-                    "color": color,
-                    "size": np.random.randint(2, 6),
-                }
-            )
+            self.particles.append({
+                "x": float(x), "y": float(y),
+                "vx": math.cos(angle) * spd,
+                "vy": math.sin(angle) * spd - 1.5,
+                "life": 1.0,
+                "color": color,
+                "size": int(np.random.randint(2, 6)),
+            })
 
     def update_and_draw(self, img):
         h, w = img.shape[:2]
@@ -410,6 +387,14 @@ class Trail:
             cv2.line(img, pts[i - 1], pts[i], color, thickness, cv2.LINE_AA)
 
 
+def draw_hand_skeleton(img, landmarks, color):
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(img, landmarks[a], landmarks[b], color, 2, cv2.LINE_AA)
+    for i, p in enumerate(landmarks):
+        radius = 6 if i in (4, 8, 12, 16, 20) else 3
+        cv2.circle(img, p, radius, color, -1, cv2.LINE_AA)
+
+
 def draw_hud(img, info):
     h, w = img.shape[:2]
     overlay = img.copy()
@@ -427,7 +412,7 @@ def draw_hud(img, info):
                 (240, h - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 110), 1, cv2.LINE_AA)
     cv2.putText(img, f"cor: {info['color']}",
                 (430, h - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 160, 220), 1, cv2.LINE_AA)
-    cv2.putText(img, info['hint'],
+    cv2.putText(img, info["hint"],
                 (610, h - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 200, 255), 1, cv2.LINE_AA)
 
 
@@ -459,11 +444,19 @@ def apply_kaleidoscope(img):
 
 
 def main():
+    try:
+        model_path = ensure_hand_model()
+    except Exception as e:
+        print(f"ERRO: nao consegui obter o modelo de maos: {e}")
+        print(f"Baixe manualmente: {MODEL_URL}")
+        print(f"E salve em: {os.path.dirname(os.path.abspath(__file__))}\\hand_landmarker.task")
+        sys.exit(1)
+
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Nao encontrei a camera. Verifique permissoes e dispositivos.")
+        print("Nao encontrei a camera.")
         return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
@@ -471,17 +464,13 @@ def main():
     audio = AudioEngine()
     try:
         audio.start()
-        print("Audio iniciado.")
     except Exception as e:
-        print(f"Aviso: nao foi possivel iniciar o audio ({e}). O programa segue em modo silencioso.")
+        print(f"Aviso: nao foi possivel iniciar o audio ({e}).")
 
+    hand_tracker = HandTracker(model_path)
     particles = ParticleSystem()
-    trail_right = Trail((100, 255, 160))  # mao direita -> verde
-    trail_left = Trail((255, 120, 255))   # mao esquerda -> magenta
-
-    skin_model = SkinModel()
-    hand_present_frames = 0  # contador pra debounce
-    last_dom_hue = -999.0
+    trail_right = Trail((100, 255, 160))
+    trail_left = Trail((255, 130, 255))
 
     prev_gray = None
     smooth_freq = 0.0
@@ -489,12 +478,10 @@ def main():
     last_color_emit = 0.0
     last_kick = 0.0
     last_snare = 0.0
+    last_dom_hue = -999.0
     kaleidoscope = False
-    show_skin_debug = False
 
-    print("SynesthAI rodando.")
-    print("PASSO 1: ponha a mao no quadrado central e aperte C pra calibrar a pele.")
-    print("Q sai | K caleidoscopio | M mute | D mostra mascara | ESPACO printa.")
+    print("SynesthAI rodando. Q sai | K caleidoscopio | M mute | ESPACO printa.")
 
     fps_t0 = time.time()
     fps_counter = 0
@@ -509,8 +496,9 @@ def main():
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            now = time.time()
 
-            # rosto e emocao
+            # --- rosto / emocao
             face_box, emotion = detect_face_emotion(gray)
             if face_box is not None:
                 audio.drone_target = 0.35
@@ -518,40 +506,20 @@ def main():
                 fx, fy, fw_, fh_ = face_box
                 color = (110, 220, 255) if emotion == "feliz" else (220, 160, 255)
                 overlay = frame.copy()
-                cv2.circle(overlay, (fx + fw_ // 2, fy + fh_ // 2), int(fw_ * 0.65), color, -1)
+                cv2.circle(overlay, (fx + fw_ // 2, fy + fh_ // 2),
+                           int(fw_ * 0.65), color, -1)
                 frame = cv2.addWeighted(frame, 0.85, overlay, 0.15, 0)
                 cv2.rectangle(frame, (fx, fy), (fx + fw_, fy + fh_), (255, 255, 255), 1, cv2.LINE_AA)
             else:
                 audio.drone_target *= 0.92
 
-            # alvo de calibracao (sempre visivel) - centro da tela
-            cal_w, cal_h = 140, 140
-            cal_x = w // 2 - cal_w // 2
-            cal_y = h // 2 - cal_h // 2
-            cal_box = (cal_x, cal_y, cal_w, cal_h)
-            cal_color = (90, 220, 90) if skin_model.calibrated else (90, 90, 255)
-            cv2.rectangle(frame, (cal_x, cal_y), (cal_x + cal_w, cal_y + cal_h), cal_color, 2, cv2.LINE_AA)
-            if not skin_model.calibrated:
-                cv2.putText(frame, "PONHA A MAO AQUI E APERTE C",
-                            (cal_x - 60, cal_y - 12), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55, (90, 90, 255), 2, cv2.LINE_AA)
+            # --- maos via MediaPipe
+            hands = hand_tracker.detect(frame)
 
-            # maos via tom de pele calibrado
-            hands, skin_mask = detect_hands(frame, skin_model, face_box)
-            now = time.time()
-
-            # debounce: so considera mao depois de 2 frames seguidos detectando
             if len(hands) >= 1:
-                hand_present_frames = min(hand_present_frames + 1, 5)
-            else:
-                hand_present_frames = max(hand_present_frames - 1, 0)
-
-            hand_active = hand_present_frames >= 2
-
-            if hand_active and len(hands) >= 1:
-                # mao a direita do quadro (espelhado -> mao direita do usuario)
+                # mao a direita do frame (espelhado -> direita do usuario)
                 rh = hands[-1]
-                rx, ry, _ = rh
+                rx, ry = rh["cx"], rh["cy"]
                 idx = int((rx / w) * (len(PENT_FREQS) - 1))
                 target_freq = PENT_FREQS[idx]
                 target_vol = max(0.0, min(1.0, 1.0 - (ry / h))) * 0.85
@@ -561,14 +529,15 @@ def main():
                 audio.target_vol = smooth_vol
                 trail_right.add(rx, ry)
                 col = hue_to_bgr(int((rx / w) * 180))
-                cv2.circle(frame, (rx, ry), 38, col, 2, cv2.LINE_AA)
-                cv2.circle(frame, (rx, ry), int(18 * target_vol + 4), col, -1, cv2.LINE_AA)
+                draw_hand_skeleton(frame, rh["landmarks"], col)
+                cv2.circle(frame, (rx, ry), int(18 * target_vol + 6), col, 2, cv2.LINE_AA)
+
                 if len(hands) >= 2:
                     lh = hands[0]
-                    lx, ly, _ = lh
+                    lx, ly = lh["cx"], lh["cy"]
                     trail_left.add(lx, ly)
-                    cv2.circle(frame, (lx, ly), 28, (255, 130, 255), 2, cv2.LINE_AA)
-                    # mao esquerda dispara voz de cor proxima dela
+                    draw_hand_skeleton(frame, lh["landmarks"], (255, 130, 255))
+                    # mao esquerda toca voz harmonica (com debounce)
                     if now - last_color_emit > 0.4:
                         f = PENT_FREQS[int((lx / w) * (len(PENT_FREQS) - 1))]
                         audio.add_color_voice(f, amp=0.14, life=0.7)
@@ -576,7 +545,6 @@ def main():
                 else:
                     trail_left.fade()
             else:
-                # sem mao: corta som rapido
                 smooth_vol *= 0.55
                 if smooth_vol < 0.01:
                     smooth_vol = 0.0
@@ -587,20 +555,17 @@ def main():
             trail_right.draw(frame)
             trail_left.draw(frame)
 
-            # movimento -> percussao (mas IGNORANDO regioes de mao/rosto pra nao
-            # disparar snare so de tocar o theremin)
-            exclude_regions = []
+            # --- movimento (excluindo rosto e maos)
+            exclude_rects = []
             if face_box is not None:
                 fx, fy, fw_, fh_ = face_box
-                exclude_regions.append({
-                    "type": "rect",
-                    "box": (max(0, fx - 25), max(0, fy - 25), fw_ + 50, fh_ + 50),
-                })
-            for hx, hy, area in hands:
-                r = int(math.sqrt(max(area, 1) / math.pi)) + 35
-                exclude_regions.append({"type": "circle", "center": (hx, hy), "radius": r})
+                exclude_rects.append((max(0, fx - 25), max(0, fy - 25), fw_ + 50, fh_ + 50))
+            for hnd in hands:
+                bx, by, bw, bh = hnd["bbox"]
+                pad = 30
+                exclude_rects.append((max(0, bx - pad), max(0, by - pad), bw + 2 * pad, bh + 2 * pad))
 
-            mot, mot_mask = motion_in_area(prev_gray, gray, exclude_regions)
+            mot, mot_mask = motion_in_area(prev_gray, gray, exclude_rects)
             if mot > 0.05 and now - last_kick > 0.35:
                 audio.trigger_kick()
                 last_kick = now
@@ -615,7 +580,7 @@ def main():
                 audio.trigger_snare()
                 last_snare = now
 
-            # cor dominante -> voz harmonica (so dispara quando a cor MUDA o suficiente)
+            # --- cor dominante
             dom = dominant_hue(frame)
             if dom is not None:
                 hue_changed = abs(dom - last_dom_hue) > 12 or last_dom_hue < -100
@@ -641,19 +606,14 @@ def main():
                 fps_counter = 0
                 fps_t0 = now
 
-            draw_hud(
-                frame,
-                {
-                    "emotion": emotion or "---",
-                    "note": audio.current_freq if audio.last_vol > 0.01 else 0.0,
-                    "color": f"{int(dom)}" if dom is not None else "---",
-                    "hint": f"FPS {fps:4.1f} {'MUDO' if audio.muted else ''} {'KALEIDO' if kaleidoscope else ''}",
-                },
-            )
+            draw_hud(frame, {
+                "emotion": emotion or "---",
+                "note": audio.current_freq if audio.last_vol > 0.01 else 0.0,
+                "color": f"{int(dom)}" if dom is not None else "---",
+                "hint": f"FPS {fps:4.1f} maos: {len(hands)} {'MUDO' if audio.muted else ''} {'KALEIDO' if kaleidoscope else ''}",
+            })
 
             cv2.imshow("SynesthAI", frame)
-            if show_skin_debug:
-                cv2.imshow("Mascara de pele (debug)", skin_mask)
             prev_gray = gray
 
             key = cv2.waitKey(1) & 0xFF
@@ -663,17 +623,13 @@ def main():
                 kaleidoscope = not kaleidoscope
             elif key == ord("m"):
                 audio.muted = not audio.muted
-            elif key == ord("c"):
-                if skin_model.calibrate(frame, cal_box):
-                    hand_present_frames = 0
-            elif key == ord("d"):
-                show_skin_debug = not show_skin_debug
-            elif key == 32:  # espaco
+            elif key == 32:
                 fn = f"synesth_{int(now)}.png"
                 cv2.imwrite(fn, frame)
                 print(f"Print salvo: {fn}")
     finally:
         audio.stop()
+        hand_tracker.close()
         cap.release()
         cv2.destroyAllWindows()
 
